@@ -1,78 +1,80 @@
 # SessionHunter
 
-**SessionWatcher** est un outil Python permettant de surveiller en temps réel les sessions utilisateurs actives sur des machines Windows distantes. 
+**SessionHunter** is a Python-based tool designed for real-time monitoring of active user sessions on remote Windows machines.
 
-Il interroge le registre distant (`Remote Registry`) pour identifier les utilisateurs connectés et résout leurs SIDs en noms d'utilisateurs lisibles via LDAP ou SAMR.
+It queries the **Remote Registry** to identify logged-on users and resolves their SIDs into human-readable usernames using a multi-layered approach (LDAP, SAMR, and LSA).
 
-## Fonctionnalités
+## Features
 
-* **Temps réel** : Rafraîchit l'affichage toutes les 5 secondes (Dashboard).
-* **Propre** : N'affiche que les machines ayant des sessions actives.
-* **Sans Agent** : Aucune installation nécessaire sur la cible.
-* **Résolution Hybride** :
-    * **LDAP** : Résolution rapide via le Contrôleur de Domaine (nécessite `-dc-ip`).
-    * **SAMR** : Résolution locale (fallback) pour les comptes locaux ou si LDAP échoue.
-* **Scan de Domaine** : Peut scanner automatiquement toutes les machines de l'AD (`-dc-ip` sans cible).
-* **Multi-threadé** : Rapide même sur un grand nombre de machines.
+* **Real-time Monitoring**: Dashboard view that refreshes automatically (default every 30 mins, adjustable).
+* **Clean Output**: Only displays hosts with active identified sessions.
+* **Agentless**: No installation or footprint required on the target machines.
+* **Triple-Layer Resolution**:
+* **LDAP**: High-speed resolution via the Domain Controller (requires `-dc-ip`).
+* **SAMR**: Local resolution fallback for local accounts.
+* **LSA (New)**: Robust SID-to-Name translation via `lsarpc` (bypasses SAMR restrictions).
 
-## 📋 Prérequis
 
-* Python 3.x
-* Un accès réseau aux machines cibles (Port 445/RPC).
-* Le service **RemoteRegistry** doit être actif sur les cibles (activé par défaut sur Windows Server, souvent désactivé sur Windows 10/11 Workstations).
-* Un compte utilisateur de domaine valide (pas besoin d'être Admin de Domaine, un utilisateur standard suffit si le RemoteRegistry est accessible).
+* **Domain-wide Scanning**: Automatically fetches all computer objects from Active Directory when no specific target is provided.
+* **Multi-threaded**: High performance even when scanning hundreds of hosts.
+
+## 📋 Prerequisites
+
+* **Python 3.x**
+* **Network Access**: SMB/RPC access to target machines (Port 445).
+* **RemoteRegistry Service**: Must be active on targets (enabled by default on Windows Server, often disabled on Windows 10/11 workstations).
+* **Permissions**: A valid domain user account is required. Local Administrative rights are needed to access the `HKEY_USERS` hive via Remote Registry.
 
 ## 🛠️ Installation
 
-1. Clonez ce dépôt ou téléchargez le script.
-2. Installez les dépendances :
+1. Clone this repository or download the script.
+2. Install dependencies:
 
 ```bash
-pip3 install -r requirements.txt
+pip3 install impacket
 
 ```
 
-*(Le fichier `requirements.txt` contient uniquement `impacket`)*.
+## 🚀 Usage
 
-## 🚀 Utilisation
-
-### Syntaxe de base
+### Basic Syntax
 
 ```bash
-python3 session-hunter.py [TARGET_IP] -u [USER] -p [PASSWORD] -d [DOMAIN]
-```
-
-### Exemples
-
-#### 1. Surveiller une machine spécifique
-
-```bash
-python3 session-hunter.py 10.0.1.26 -u pavic -p 'Password1234!' -d INTRA.LOCAL
+python3 session_hunter.py [TARGET_IP] -u [USER] -p [PASSWORD] -d [DOMAIN]
 
 ```
 
-#### 2. Surveiller tout le domaine (Scan AD complet)
+### Examples
 
-Si aucune cible n'est spécifiée mais que l'IP du DC est fournie, le script récupère toutes les machines de l'AD via LDAP et les surveille.
+#### 1. Monitor a specific machine
 
 ```bash
-python3 session-hunter.py -u pavic -p 'Password1234!' -d INTRA.LOCAL -dc-ip 10.0.1.10
+python3 session_hunter.py 10.0.1.26 -u jimmy -p 'Password1234!' -d INTRA.LOCAL
 
 ```
 
-#### 3. Résolution optimisée avec LDAP (Recommandé)
+#### 2. Scan the entire Domain (AD Discovery)
 
-Fournir l'IP du DC permet de résoudre les SIDs beaucoup plus efficacement. Vous pouvez aussi spécifier une base de recherche personnalisée (utile pour les domaines enfants ou les relations de confiance).
+If no target is specified but a DC IP is provided, the script retrieves all computers from AD via LDAP and monitors them.
 
 ```bash
-python3 session-hunter.py 10.0.1.26 -u pavic -p 'Password!' -d INTRA.LOCAL -dc-ip 10.0.1.10 -ldap-base "dc=lab,dc=local"
+python3 session_hunter.py -u jimmy -p 'Password1234!' -d INTRA.LOCAL -dc-ip 10.0.1.10
 
 ```
 
-#### 4. Utilisation avec un Hash (Pass-the-Hash)
+#### 3. Optimized Resolution with LDAP (Recommended)
+
+Providing the DC IP allows the script to resolve SIDs much faster using LDAP queries.
 
 ```bash
-python3 session-hunter.py 10.0.1.26 -u pavic -H 'LMHASH:NTHASH' -d INTRA.LOCAL
+python3 session_hunter.py 10.0.1.26 -u jimmy -p 'Password!' -d INTRA.LOCAL -dc-ip 10.0.1.10 -ldap-base "dc=intra,dc=local"
+
+```
+
+#### 4. Pass-the-Hash (PtH)
+
+```bash
+python3 session_hunter.py 10.0.1.26 -u jimmy -H 'LMHASH:NTHASH' -d INTRA.LOCAL
 
 ```
 
@@ -80,24 +82,22 @@ python3 session-hunter.py 10.0.1.26 -u pavic -H 'LMHASH:NTHASH' -d INTRA.LOCAL
 
 | Argument | Description |
 | --- | --- |
-| `target` | (Optionnel) IP ou Nom d'hôte de la machine cible. Si omis, nécessite `-dc-ip`. |
-| `-u`, `--username` | Nom d'utilisateur. |
-| `-p`, `--password` | Mot de passe. |
-| `-d`, `--domain` | Domaine Active Directory. |
-| `-H`, `--hashes` | Authentification via Hash (Format `LM:NT`). |
-| `-dc-ip` | Adresse IP du Contrôleur de Domaine (Requis pour le scan de masse et la résolution LDAP). |
-| `-ldap-base` | (Optionnel) Base DN personnalisée pour la recherche LDAP (ex: `dc=sub,dc=domain,dc=com`). |
-| `-t`, `--threads` | Nombre de threads pour le scan (Défaut: 10). |
+| `target` | (Optional) IP or Hostname of the target. If omitted, `-dc-ip` is required for discovery. |
+| `-u`, `--username` | Username for authentication. |
+| `-p`, `--password` | Password for authentication. |
+| `-d`, `--domain` | Active Directory domain name. |
+| `-H`, `--hashes` | NTLM hash for authentication (Format `LM:NT`). |
+| `-dc-ip` | Domain Controller IP (Required for AD scan and LDAP resolution). |
+| `-ldap-base` | (Optional) Custom Base DN for LDAP searches. |
+| `-t`, `--threads` | Number of concurrent threads (Default: 10). |
+
+## ⚠️ Troubleshooting
+
+* **No output?**: The script filters out machines without active sessions. If the table is empty, no users are currently logged into the scanned targets.
+* **"Unreachable / Service Stopped"**:
+* Ensure the firewall allows **File and Printer Sharing (SMB-In)** and **Remote Administration**.
+* Ensure the **RemoteRegistry** service is running.
+* *Pro-tip:* On Windows 10/11, you may need to start the service manually: `Start-Service RemoteRegistry`.
 
 
-
-
-3. **Affichage** : Il affiche le résultat dans un tableau propre et recommence la boucle après 5 secondes.
-
-## ⚠️ Dépannage
-
-* **Rien ne s'affiche ?** : Le script n'affiche que les machines avec des sessions actives. Si personne n'est connecté, la liste reste vide.
-* **"Unreachable / Service Stopped"** :
-* Vérifiez que le pare-feu autorise le RPC/SMB (Port 445).
-* Vérifiez que le service **RemoteRegistry** est démarré sur la cible.
-* *Astuce :* Sur les versions clients (Win 10/11), ce service est souvent arrêté par défaut. Sur les serveurs, il est souvent actif.
+* **"Admin: NON"**: Your current user does not have administrative privileges on the target machine, which is required to read `HKEY_USERS`.
