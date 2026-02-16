@@ -4,7 +4,7 @@
 
 Il interroge le registre distant (`Remote Registry`) pour identifier les utilisateurs connectés et résout leurs SIDs en noms d'utilisateurs lisibles via LDAP ou SAMR.
 
-## ⚡ Fonctionnalités
+## Fonctionnalités
 
 * **Temps réel** : Rafraîchit l'affichage toutes les 5 secondes (Dashboard).
 * **Propre** : N'affiche que les machines ayant des sessions actives.
@@ -40,7 +40,6 @@ pip3 install -r requirements.txt
 
 ```bash
 python3 session-hunter.py [TARGET_IP] -u [USER] -p [PASSWORD] -d [DOMAIN]
-
 ```
 
 ### Exemples
@@ -90,17 +89,10 @@ python3 session-hunter.py 10.0.1.26 -u pavic -H 'LMHASH:NTHASH' -d INTRA.LOCAL
 | `-ldap-base` | (Optionnel) Base DN personnalisée pour la recherche LDAP (ex: `dc=sub,dc=domain,dc=com`). |
 | `-t`, `--threads` | Nombre de threads pour le scan (Défaut: 10). |
 
-## 🔎 Fonctionnement Technique
-
-1. **Connexion** : Le script se connecte au pipe `winreg` (Windows Remote Registry) via SMB (Port 445).
-2. **Énumération** : Il liste les sous-clés de la ruche `HKEY_USERS`. Chaque clé correspond au SID d'un utilisateur ayant une session (ou un profil chargé).
-3. **Filtrage** : Il ignore les comptes systèmes (`S-1-5-18`, etc.) et les classes (`_Classes`).
-4. **Résolution** :
-* Il convertit le SID binaire et interroge le LDAP (si `-dc-ip` est fourni).
-* Sinon, il interroge le service SAMR de la machine distante.
 
 
-5. **Affichage** : Il affiche le résultat dans un tableau propre et recommence la boucle après 5 secondes.
+
+3. **Affichage** : Il affiche le résultat dans un tableau propre et recommence la boucle après 5 secondes.
 
 ## ⚠️ Dépannage
 
