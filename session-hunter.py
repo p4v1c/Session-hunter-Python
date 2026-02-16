@@ -8,13 +8,14 @@ import socket
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-# Ajout de lsat et lsad pour la résolution via LSA
+# Imports Impacket
 from impacket.dcerpc.v5 import transport, rrp, samr, scmr, lsat, lsad
 from impacket.dcerpc.v5.rpcrt import DCERPCException
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldapasn1
 from impacket.dcerpc.v5.samr import USER_INFORMATION_CLASS
 
+# Désactiver les logs
 logging.getLogger("impacket").setLevel(logging.CRITICAL)
 
 class ADEnumerator:
@@ -144,15 +145,14 @@ class SessionHunter:
         except: return None
 
     def resolve_sid_via_lsa(self, sid_str):
-        """ Nouvelle méthode : Résolution via LSA (lsarpc) """
         try:
             dce = self._get_dce('lsarpc', lsat.MSRPC_UUID_LSAT)
             ans = lsad.hLsarOpenPolicy2(dce)
             policyHandle = ans['PolicyHandle']
-            
+
             ans = lsat.hLsarLookupSids(dce, policyHandle, [sid_str])
             name = str(ans['TranslatedNames']['Names'][0]['Name'])
-            
+
             lsad.hLsarClose(dce, policyHandle)
             dce.disconnect()
             return f"{name} (LSA)"
@@ -160,19 +160,16 @@ class SessionHunter:
             return None
 
     def resolve_sid_name(self, sid_str):
-        # 1. Tentative LDAP (C'est le plus propre pour l'AD)
         if self.ad_enumerator:
             name = self.ad_enumerator.resolve_sid_via_ldap(sid_str)
             if name: return name
-            
-        # 2. Tentative SAMR (Comptes locaux)
+
         name = self.resolve_sid_via_samr(sid_str)
         if name: return name
-        
-        # 3. Tentative LSA (Fallback testé et validé)
+
         name = self.resolve_sid_via_lsa(sid_str)
         if name: return name
-        
+
         return f"{sid_str} (Unknown)"
 
     def hunt(self):
@@ -199,8 +196,7 @@ class SessionHunter:
         except Exception:
             return None
 
-# --- [Le reste du code reste identique (DNS fix, scan_host, main)] ---
-
+# --- DNS FIX ---
 def simple_dns_query(hostname, dns_server):
     try:
         transaction_id = b'\xaa\xaa'
@@ -240,19 +236,24 @@ def resolve_target(target, dc_ip):
 
 def scan_host(target_name, args, ad_enum):
     target_ip = resolve_target(target_name, args.dc_ip)
+
+    # Si résolution DNS impossible, on retourne vide (pas d'affichage)
     if not target_ip:
-         return [(target_name, "\033[90m-\033[0m", "\033[90mDNS Failed\033[0m")]
+         return []
+
     hunter = SessionHunter(args.username, args.password, args.domain, target_ip, args.hashes, ad_enum)
     sessions = hunter.hunt()
+
     results = []
+
+    # Couleur Admin
     admin_str = "\033[1;32mOUI\033[0m" if hunter.is_admin else "\033[1;31mNON\033[0m"
-    if sessions is None:
-        results.append((target_name, "\033[90m-\033[0m", "\033[90mUnreachable\033[0m"))
-    elif not sessions:
-        pass
-    else:
+
+    # LOGIQUE DE FILTRAGE : Si sessions est None ou vide, on n'ajoute rien.
+    if sessions:
         for s in sessions:
             results.append((target_name, admin_str, f"\033[1;36m{s}\033[0m"))
+
     return results
 
 def main():
