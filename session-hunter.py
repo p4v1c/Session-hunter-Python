@@ -8,13 +8,12 @@ import socket
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-
-from impacket.dcerpc.v5 import transport, rrp, samr, scmr
+# Ajout de lsat et lsad pour la résolution via LSA
+from impacket.dcerpc.v5 import transport, rrp, samr, scmr, lsat, lsad
 from impacket.dcerpc.v5.rpcrt import DCERPCException
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldapasn1
 from impacket.dcerpc.v5.samr import USER_INFORMATION_CLASS
-
 
 logging.getLogger("impacket").setLevel(logging.CRITICAL)
 
@@ -71,7 +70,7 @@ class ADEnumerator:
                 if isinstance(item, ldapasn1.SearchResultEntry):
                     for attribute in item['attributes']:
                         if str(attribute['type']) == 'sAMAccountName':
-                            return f"{self.domain}\\{str(attribute['vals'][0])}"
+                            return f"{self.domain}\\{str(attribute['vals'][0])} (LDAP)"
         except: pass
         return None
 
@@ -114,10 +113,8 @@ class SessionHunter:
         return dce
 
     def check_admin(self):
-        """Vérifie si Admin Local via SCMR"""
         try:
             dce = self._get_dce('svcctl', scmr.MSRPC_UUID_SCMR)
-            # 0x0002 = SC_MANAGER_CREATE_SERVICE
             ans = scmr.hROpenSCManagerW(dce, lpMachineName=self.target, dwDesiredAccess=0x0002)
             scmr.hRCloseServiceHandle(dce, ans['lpScHandle'])
             self.is_admin = True
@@ -141,23 +138,45 @@ class SessionHunter:
             ans = samr.hSamrOpenUser(dce, domainHandle, userId=rid)
             userHandle = ans['UserHandle']
             ans = samr.hSamrQueryInformationUser(dce, userHandle, USER_INFORMATION_CLASS.UserGeneralInformation)
-            user_name = ans['Buffer']['General']['UserName']
+            user_name = str(ans['Buffer']['General']['UserName'])
             dce.disconnect()
             return f"{user_name} (SAMR)"
         except: return None
 
+    def resolve_sid_via_lsa(self, sid_str):
+        """ Nouvelle méthode : Résolution via LSA (lsarpc) """
+        try:
+            dce = self._get_dce('lsarpc', lsat.MSRPC_UUID_LSAT)
+            ans = lsad.hLsarOpenPolicy2(dce)
+            policyHandle = ans['PolicyHandle']
+            
+            ans = lsat.hLsarLookupSids(dce, policyHandle, [sid_str])
+            name = str(ans['TranslatedNames']['Names'][0]['Name'])
+            
+            lsad.hLsarClose(dce, policyHandle)
+            dce.disconnect()
+            return f"{name} (LSA)"
+        except:
+            return None
+
     def resolve_sid_name(self, sid_str):
+        # 1. Tentative LDAP (C'est le plus propre pour l'AD)
         if self.ad_enumerator:
             name = self.ad_enumerator.resolve_sid_via_ldap(sid_str)
             if name: return name
+            
+        # 2. Tentative SAMR (Comptes locaux)
         name = self.resolve_sid_via_samr(sid_str)
         if name: return name
+        
+        # 3. Tentative LSA (Fallback testé et validé)
+        name = self.resolve_sid_via_lsa(sid_str)
+        if name: return name
+        
         return f"{sid_str} (Unknown)"
 
     def hunt(self):
-        # 1. Check Admin
         self.check_admin()
-
         sessions = []
         try:
             dce = self._get_dce('winreg', rrp.MSRPC_UUID_RRP)
@@ -180,7 +199,8 @@ class SessionHunter:
         except Exception:
             return None
 
-# --- DNS FIX ---
+# --- [Le reste du code reste identique (DNS fix, scan_host, main)] ---
+
 def simple_dns_query(hostname, dns_server):
     try:
         transaction_id = b'\xaa\xaa'
@@ -194,7 +214,6 @@ def simple_dns_query(hostname, dns_server):
             query += bytes([len(part)]) + part.encode()
         query += b'\x00'
         query += b'\x00\x01' + b'\x00\x01'
-
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(1)
         sock.sendto(query, (dns_server, 53))
@@ -221,30 +240,19 @@ def resolve_target(target, dc_ip):
 
 def scan_host(target_name, args, ad_enum):
     target_ip = resolve_target(target_name, args.dc_ip)
-
-    # Si résolution DNS impossible, on affiche l'erreur
     if not target_ip:
          return [(target_name, "\033[90m-\033[0m", "\033[90mDNS Failed\033[0m")]
-
     hunter = SessionHunter(args.username, args.password, args.domain, target_ip, args.hashes, ad_enum)
     sessions = hunter.hunt()
-
     results = []
-
-    # Couleur Admin
     admin_str = "\033[1;32mOUI\033[0m" if hunter.is_admin else "\033[1;31mNON\033[0m"
-
     if sessions is None:
-        # Erreur connexion : on l'affiche quand même pour savoir que la cible est down/bloquée
-        results.append((target_name, "\033[90m-\033[0m", "\033[90mUnreachable / Service Stopped\033[0m"))
+        results.append((target_name, "\033[90m-\033[0m", "\033[90mUnreachable\033[0m"))
     elif not sessions:
-        # Pas de sessions : ON N'AFFICHE RIEN (pass)
         pass
     else:
-        # Sessions trouvées : ON AFFICHE
         for s in sessions:
             results.append((target_name, admin_str, f"\033[1;36m{s}\033[0m"))
-
     return results
 
 def main():
@@ -293,14 +301,13 @@ def main():
             print("-" * 95)
 
             if not all_rows:
-                print("No active sessions found (or hosts unreachable).")
+                print("No active sessions found.")
             else:
                 for row in all_rows:
                     host, admin, user = row
                     print(f"{host:<30} | {admin:<10} | {user:<50}")
 
-            time.sleep(5)
-
+            time.sleep(1800)
     except KeyboardInterrupt:
         print("\n[!] Arrêt demandé.")
         sys.exit(0)
