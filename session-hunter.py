@@ -9,11 +9,10 @@ import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-from impacket.dcerpc.v5 import transport, rrp, samr, scmr, lsat, lsad
+from impacket.dcerpc.v5 import transport, rrp, samr, scmr
 from impacket.dcerpc.v5.rpcrt import DCERPCException
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldapasn1
-from impacket.dcerpc.v5.samr import USER_INFORMATION_CLASS
 
 logging.getLogger("impacket").setLevel(logging.CRITICAL)
 
@@ -108,20 +107,42 @@ class PersistentSessionHunter:
         self.username = username
         self.password = password
         self.domain = domain
-        self.target = target_ip 
-        self.target_name = target_name 
+        self.target = target_ip
+        self.target_name = target_name
         self.cache_sids = cache_sids
         self.lmhash = ''
         self.nthash = ''
         if hashes: self.lmhash, self.nthash = hashes.split(':')
 
-        self.dce = None 
+        self.dce = None
         self.connected = False
-        self.is_admin = False
+        self.is_admin = False 
+
+    def check_admin_status(self):
+        """ Vérifie UNE FOIS si on est admin via Service Manager """
+        try:
+            binding = f'ncacn_np:{self.target}[\\pipe\\svcctl]'
+            rpctransport = transport.DCERPCTransportFactory(binding)
+            rpctransport.set_connect_timeout(2)
+            if hasattr(rpctransport, 'set_credentials'):
+                rpctransport.set_credentials(self.username, self.password, self.domain, self.lmhash, self.nthash)
+
+            dce_admin = rpctransport.get_dce_rpc()
+            dce_admin.connect()
+            dce_admin.bind(scmr.MSRPC_UUID_SCMR)
+
+            ans = scmr.hROpenSCManagerW(dce_admin, lpMachineName=self.target, dwDesiredAccess=0x0002)
+            scmr.hRCloseServiceHandle(dce_admin, ans['lpScHandle'])
+
+            dce_admin.disconnect()
+            return True
+        except:
+            return False
 
     def connect_rpc(self):
-        """Établit la connexion SMB/RPC et la garde ouverte."""
+        """Établit la connexion SMB/RPC pour WINREG."""
         try:
+            self.is_admin = self.check_admin_status()
             binding = f'ncacn_np:{self.target}[\\pipe\\winreg]'
             rpctransport = transport.DCERPCTransportFactory(binding)
             rpctransport.set_connect_timeout(2)
@@ -136,9 +157,6 @@ class PersistentSessionHunter:
         except:
             self.connected = False
             return False
-
-    def check_admin(self):
-        return True
 
     def hunt(self):
         if not self.connected:
@@ -161,7 +179,7 @@ class PersistentSessionHunter:
                         else:
                             sessions.append(f"{sid} (Unknown)")
                     index += 1
-                except: break 
+                except: break
 
             rrp.hBaseRegCloseKey(self.dce, hRootKey)
             return sessions
@@ -200,7 +218,7 @@ def main():
         from getpass import getpass; args.password = getpass("Password: ")
 
     FULL_CACHE = load_cache()
-    if 'sids' not in FULL_CACHE: FULL_CACHE = {'sids': FULL_CACHE, 'targets': []} # Migration
+    if 'sids' not in FULL_CACHE: FULL_CACHE = {'sids': FULL_CACHE, 'targets': []}
     CACHE_SIDS = FULL_CACHE['sids']
     CACHE_TARGETS = FULL_CACHE['targets']
 
@@ -241,16 +259,21 @@ def main():
                     h = futures[future]
                     sessions = future.result()
 
+                    if h.is_admin:
+                        admin_str = "\033[1;32mYEP\033[0m" #
+                    else:
+                        admin_str = "\033[1;31mNOP\033[0m" 
+
                     if sessions:
                         for s in sessions:
-                            all_rows.append((h.target_name, "\033[1;32mOUI\033[0m", f"\033[1;36m{s}\033[0m"))
+                            all_rows.append((h.target_name, admin_str, f"\033[1;36m{s}\033[0m"))
                     elif sessions is None:
                         pass
 
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"--- SESSION HUNTER (Persistent Mode) --- {datetime.now().strftime('%H:%M:%S')} (Ctrl+C to stop)")
+            print(f"--- SESSION HUNTER --- {datetime.now().strftime('%H:%M:%S')} (Ctrl+C to stop)")
             print(f"Cache: {len(CACHE_SIDS)} Users | Monitors: {len(hunters)} Hosts")
-            print(f"{'HOST':<30} | {'ACTIVE':<10} | {'SESSION(S)':<50}")
+            print(f"{'HOST':<30} | {'ADMIN':<10} | {'SESSION(S)':<50}")
             print("-" * 95)
 
             if not all_rows: print("No active sessions found.")
@@ -259,7 +282,7 @@ def main():
                     host, admin, user = row
                     print(f"{host:<30} | {admin:<10} | {user:<50}")
 
-            time.sleep(1800)
+            time.sleep(5)
 
     except KeyboardInterrupt:
         print("\n[!] Closing connections...")
