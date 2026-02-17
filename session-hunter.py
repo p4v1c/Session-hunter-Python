@@ -282,7 +282,7 @@ def main():
                     host, admin, user = row
                     print(f"{host:<30} | {admin:<10} | {user:<50}")
 
-            time.sleep(5)
+            time.sleep(1800)
 
     except KeyboardInterrupt:
         print("\n[!] Closing connections...")
