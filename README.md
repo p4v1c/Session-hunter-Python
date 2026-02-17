@@ -38,7 +38,7 @@ pip3 install git+https://github.com/p4v1c/Session-hunter-Python.git
 ### Basic Syntax
 
 ```bash
-python3 session_hunter [TARGET_IP] -u [USER] -p [PASSWORD] -d [DOMAIN]
+python3 -m session_hunter [TARGET_IP] -u [USER] -p [PASSWORD] -d [DOMAIN]
 
 ```
 
@@ -47,7 +47,7 @@ python3 session_hunter [TARGET_IP] -u [USER] -p [PASSWORD] -d [DOMAIN]
 #### 1. Monitor a specific machine
 
 ```bash
-python3 session_hunter 10.0.1.26 -u jimmy -p 'Password1234!' -d INTRA.LOCAL
+python3 -m session_hunter 10.0.1.26 -u jimmy -p 'Password1234!' -d INTRA.LOCAL
 
 ```
 
@@ -56,7 +56,7 @@ python3 session_hunter 10.0.1.26 -u jimmy -p 'Password1234!' -d INTRA.LOCAL
 If no target is specified but a DC IP is provided, the script retrieves all computers from AD via LDAP and monitors them.
 
 ```bash
-python3 session_hunter -u jimmy -p 'Password1234!' -d INTRA.LOCAL -dc-ip 10.0.1.10
+python3 -m session_hunter -u jimmy -p 'Password1234!' -d INTRA.LOCAL -dc-ip 10.0.1.10
 
 ```
 
@@ -65,14 +65,14 @@ python3 session_hunter -u jimmy -p 'Password1234!' -d INTRA.LOCAL -dc-ip 10.0.1.
 Providing the DC IP allows the script to resolve SIDs much faster using LDAP queries.
 
 ```bash
-python3 session_hunter 10.0.1.26 -u jimmy -p 'Password!' -d INTRA.LOCAL -dc-ip 10.0.1.10 -ldap-base "dc=intra,dc=local"
+python3 -m session_hunter 10.0.1.26 -u jimmy -p 'Password!' -d INTRA.LOCAL -dc-ip 10.0.1.10 -ldap-base "dc=intra,dc=local"
 
 ```
 
 #### 4. Pass-the-Hash (PtH)
 
 ```bash
-python3 session_hunter 10.0.1.26 -u jimmy -H 'LMHASH:NTHASH' -d INTRA.LOCAL
+python3 -m session_hunter 10.0.1.26 -u jimmy -H 'LMHASH:NTHASH' -d INTRA.LOCAL
 
 ```
 
