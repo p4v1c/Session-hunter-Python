@@ -33,6 +33,12 @@ It queries the **Remote Registry** to identify logged-on users and resolves thei
 pip3 install git+https://github.com/p4v1c/Session-hunter-Python.git
 ```
 
+2. Setup alias :
+
+```bash
+echo "alias session-hunter='python3 -m session_hunter'" >> ~/.zshrc && source ~/.zshrc
+``` 
+
 ## 🚀 Usage
 
 ### Basic Syntax
