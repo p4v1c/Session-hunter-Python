@@ -1,16 +1,20 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
 setup(
-    name="Session-hunter",
+    name="session-hunter",
     version="1.0.0",
-    description="Enumerate sessions Windows via RPC/SMB",
-    packages=find_packages(),
+    description="Real-time Windows session monitoring tool",
+    author="p4v1c",
+    url="https://github.com/p4v1c/Session-hunter-Python",
+    py_modules=["session_hunter"],
+
     install_requires=[
         "impacket",
     ],
     entry_points={
         'console_scripts': [
-            'session-hunter = session-hunter.main:main',
+            'session-hunter = session_hunter:main',
         ],
     },
+    python_requires='>=3.6',
 )
