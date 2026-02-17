@@ -70,16 +70,34 @@ class ADEnumerator:
 
     def get_domain_computers(self):
         if not self.connect(): return []
-        computers = []
+        
         print("[*] LDAP: Downloading computer list...")
-        try:
-            resp = self.ldap_connection.search(searchFilter="(&(objectCategory=computer))", attributes=['dNSHostName'])
-            for item in resp:
+        
+        def parse_results(response):
+            comps = []
+            for item in response:
                 if isinstance(item, ldapasn1.SearchResultEntry):
                     for attr in item['attributes']:
-                        if str(attr['type']) == 'dNSHostName': val = str(attr['vals'][0]); computers.append(val)
-        except: pass
-        return computers
+                        if str(attr['type']) == 'dNSHostName': 
+                            val = str(attr['vals'][0])
+                            comps.append(val)
+            return comps
+
+        try:
+            # Tentative 1
+            resp = self.ldap_connection.search(searchFilter="(&(objectCategory=computer))", attributes=['dNSHostName'])
+            return parse_results(resp)
+        except Exception:
+            # Si échec (ex: Broken Pipe après le prefetch des users), on reconnecte et on réessaie
+            # print("[!] LDAP connection timed out, retrying...") # Debug info
+            self.ldap_connection = None # Force le reset
+            if self.connect():
+                try:
+                    resp = self.ldap_connection.search(searchFilter="(&(objectCategory=computer))", attributes=['dNSHostName'])
+                    return parse_results(resp)
+                except: pass
+        
+        return []
 
 def simple_dns_query(hostname, dns_server):
     try:
@@ -107,42 +125,41 @@ class PersistentSessionHunter:
         self.username = username
         self.password = password
         self.domain = domain
-        self.target = target_ip
-        self.target_name = target_name
+        self.target = target_ip 
+        self.target_name = target_name 
         self.cache_sids = cache_sids
         self.lmhash = ''
         self.nthash = ''
         if hashes: self.lmhash, self.nthash = hashes.split(':')
 
-        self.dce = None
+        self.dce = None 
         self.connected = False
         self.is_admin = False 
 
     def check_admin_status(self):
-        """ Vérifie UNE FOIS si on est admin via Service Manager """
         try:
             binding = f'ncacn_np:{self.target}[\\pipe\\svcctl]'
             rpctransport = transport.DCERPCTransportFactory(binding)
             rpctransport.set_connect_timeout(2)
             if hasattr(rpctransport, 'set_credentials'):
                 rpctransport.set_credentials(self.username, self.password, self.domain, self.lmhash, self.nthash)
-
+            
             dce_admin = rpctransport.get_dce_rpc()
             dce_admin.connect()
             dce_admin.bind(scmr.MSRPC_UUID_SCMR)
-
+            
             ans = scmr.hROpenSCManagerW(dce_admin, lpMachineName=self.target, dwDesiredAccess=0x0002)
             scmr.hRCloseServiceHandle(dce_admin, ans['lpScHandle'])
-
             dce_admin.disconnect()
             return True
         except:
             return False
 
     def connect_rpc(self):
-        """Établit la connexion SMB/RPC pour WINREG."""
         try:
-            self.is_admin = self.check_admin_status()
+            if not self.is_admin:
+                self.is_admin = self.check_admin_status()
+
             binding = f'ncacn_np:{self.target}[\\pipe\\winreg]'
             rpctransport = transport.DCERPCTransportFactory(binding)
             rpctransport.set_connect_timeout(2)
@@ -179,7 +196,7 @@ class PersistentSessionHunter:
                         else:
                             sessions.append(f"{sid} (Unknown)")
                     index += 1
-                except: break
+                except: break 
 
             rrp.hBaseRegCloseKey(self.dce, hRootKey)
             return sessions
@@ -223,8 +240,14 @@ def main():
     CACHE_TARGETS = FULL_CACHE['targets']
 
     ad_enum = None
+    if args.dc_ip:
+        need_users = (not CACHE_SIDS or args.refresh)
+        need_targets = (not CACHE_TARGETS or args.refresh) and not args.target
+        
+        if need_users or need_targets:
+            ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
+
     if args.dc_ip and (not CACHE_SIDS or args.refresh):
-        ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
         fetched = ad_enum.prefetch_all_users()
         if fetched: CACHE_SIDS.update(fetched); save_cache(FULL_CACHE)
 
@@ -232,14 +255,18 @@ def main():
     if args.target: target_list = [args.target]
     elif args.dc_ip:
         if not CACHE_TARGETS or args.refresh:
-            if not ad_enum: ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
             target_list = ad_enum.get_domain_computers()
-            if target_list: FULL_CACHE['targets'] = target_list; save_cache(FULL_CACHE)
-        else: target_list = CACHE_TARGETS
+            if target_list: 
+                FULL_CACHE['targets'] = target_list
+                save_cache(FULL_CACHE)
+        else: 
+            target_list = CACHE_TARGETS
 
-    if not target_list: print("[-] Aucune cible."); sys.exit(1)
+    if not target_list: 
+        print("[-] No target found (LDAP issue or empty cache).")
+        sys.exit(1)
 
-    print(f"[*] Initialisation des connexions vers {len(target_list)} cibles...")
+    print(f"[*] Initialization a connections to {len(target_list)} cibles...")
     hunters = []
 
     for host in target_list:
@@ -259,10 +286,8 @@ def main():
                     h = futures[future]
                     sessions = future.result()
 
-                    if h.is_admin:
-                        admin_str = "\033[1;32mYEP\033[0m" #
-                    else:
-                        admin_str = "\033[1;31mNOP\033[0m" 
+                    if h.is_admin: admin_str = "\033[1;32mYES\033[0m"
+                    else: admin_str = "\033[1;31mNO\033[0m"
 
                     if sessions:
                         for s in sessions:
@@ -275,7 +300,7 @@ def main():
             print(f"Cache: {len(CACHE_SIDS)} Users | Monitors: {len(hunters)} Hosts")
             print(f"{'HOST':<30} | {'ADMIN':<10} | {'SESSION(S)':<50}")
             print("-" * 95)
-
+            
             if not all_rows: print("No active sessions found.")
             else:
                 for row in all_rows:
