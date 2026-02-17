@@ -239,7 +239,7 @@ def main():
 
     if not target_list: print("[-] Aucune cible."); sys.exit(1)
 
-    print(f"[*] Initialisation des connexions persistantes vers {len(target_list)} cibles...")
+    print(f"[*] Initialisation des connexions vers {len(target_list)} cibles...")
     hunters = []
 
     for host in target_list:
