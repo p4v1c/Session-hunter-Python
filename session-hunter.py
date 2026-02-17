@@ -5,18 +5,19 @@ import struct
 import time
 import os
 import socket
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-# Imports Impacket
 from impacket.dcerpc.v5 import transport, rrp, samr, scmr, lsat, lsad
 from impacket.dcerpc.v5.rpcrt import DCERPCException
 from impacket.ldap import ldap as ldap_impacket
 from impacket.ldap import ldapasn1
 from impacket.dcerpc.v5.samr import USER_INFORMATION_CLASS
 
-# Désactiver les logs
 logging.getLogger("impacket").setLevel(logging.CRITICAL)
+
+CACHE_FILE = "session_cache.json"
 
 class ADEnumerator:
     def __init__(self, username, password, domain, dc_ip, custom_base=None, hashes=None):
@@ -24,237 +25,164 @@ class ADEnumerator:
         self.password = password
         self.domain = domain
         self.dc_ip = dc_ip
-        if custom_base:
-            self.base_dn = custom_base
-        else:
-            self.base_dn = ','.join([f"dc={x}" for x in self.domain.split('.')])
+        if custom_base: self.base_dn = custom_base
+        else: self.base_dn = ','.join([f"dc={x}" for x in self.domain.split('.')])
         self.lmhash = ''
         self.nthash = ''
-        if hashes:
-            self.lmhash, self.nthash = hashes.split(':')
+        if hashes: self.lmhash, self.nthash = hashes.split(':')
         self.ldap_connection = None
 
     def connect(self):
+        if self.ldap_connection: return True
         try:
             ldap_url = f"ldap://{self.dc_ip}"
             self.ldap_connection = ldap_impacket.LDAPConnection(ldap_url, self.base_dn, self.dc_ip)
             self.ldap_connection.login(self.username, self.password, self.domain, self.lmhash, self.nthash)
             return True
-        except:
-            return False
+        except: return False
 
-    def sid_to_ldap_filter(self, sid_str):
+    def binary_sid_to_string(self, sid_bytes):
         try:
-            parts = sid_str.split('-')
-            revision = int(parts[1])
-            identifier_authority = int(parts[2])
-            sub_authorities = [int(x) for x in parts[3:]]
-            binary = bytearray()
-            binary.append(revision)
-            binary.append(len(sub_authorities))
-            id_auth_bytes = struct.pack('>Q', identifier_authority)[2:]
-            binary.extend(id_auth_bytes)
-            for sub in sub_authorities:
-                binary.extend(struct.pack('<I', sub))
-            escaped_sid = "".join([f"\\{b:02x}" for b in binary])
-            return f"(objectSid={escaped_sid})"
-        except:
-            return None
+            revision = sid_bytes[0]
+            identifier_authority = int.from_bytes(sid_bytes[2:8], byteorder='big')
+            sub_authorities = []
+            for i in range((len(sid_bytes) - 8) // 4):
+                start = 8 + (i * 4)
+                val = int.from_bytes(sid_bytes[start:start+4], byteorder='little')
+                sub_authorities.append(str(val))
+            return f"S-{revision}-{identifier_authority}-{'-'.join(sub_authorities)}"
+        except: return None
 
-    def resolve_sid_via_ldap(self, sid_str):
-        if not self.ldap_connection and not self.connect(): return None
+    def prefetch_all_users(self):
+        cache_update = {}
+        if not self.connect(): return {}
+        print("[*] LDAP: Prefetching all users...")
         try:
-            search_filter = self.sid_to_ldap_filter(sid_str)
-            if not search_filter: return None
-            resp = self.ldap_connection.search(searchBase=self.base_dn, searchFilter=search_filter, attributes=['sAMAccountName'])
+            resp = self.ldap_connection.search(searchBase=self.base_dn, searchFilter="(&(objectClass=user)(objectCategory=person))", attributes=['sAMAccountName', 'objectSid'])
             for item in resp:
                 if isinstance(item, ldapasn1.SearchResultEntry):
-                    for attribute in item['attributes']:
-                        if str(attribute['type']) == 'sAMAccountName':
-                            return f"{self.domain}\\{str(attribute['vals'][0])} (LDAP)"
-        except: pass
-        return None
+                    username = None; sid_str = None
+                    for attr in item['attributes']:
+                        if str(attr['type']) == 'sAMAccountName': username = str(attr['vals'][0])
+                        elif str(attr['type']) == 'objectSid': sid_str = self.binary_sid_to_string(attr['vals'][0])
+                    if username and sid_str: cache_update[sid_str] = f"{self.domain}\\{username}"
+            return cache_update
+        except: return {}
 
     def get_domain_computers(self):
-        if not self.ldap_connection and not self.connect(): return []
+        if not self.connect(): return []
         computers = []
+        print("[*] LDAP: Downloading computer list...")
         try:
             resp = self.ldap_connection.search(searchFilter="(&(objectCategory=computer))", attributes=['dNSHostName'])
             for item in resp:
                 if isinstance(item, ldapasn1.SearchResultEntry):
                     for attr in item['attributes']:
-                        if str(attr['type']) == 'dNSHostName':
-                            val = str(attr['vals'][0])
-                            if val: computers.append(val)
+                        if str(attr['type']) == 'dNSHostName': val = str(attr['vals'][0]); computers.append(val)
         except: pass
         return computers
 
-class SessionHunter:
-    def __init__(self, username, password, domain, target_ip, hashes=None, ad_enumerator=None):
-        self.username = username
-        self.password = password
-        self.domain = domain
-        self.target = target_ip
-        self.lmhash = ''
-        self.nthash = ''
-        self.ad_enumerator = ad_enumerator
-        if hashes:
-            self.lmhash, self.nthash = hashes.split(':')
-        self.is_admin = False
-
-    def _get_dce(self, pipe_name, uuid):
-        binding = f'ncacn_np:{self.target}[\\pipe\\{pipe_name}]'
-        rpctransport = transport.DCERPCTransportFactory(binding)
-        rpctransport.set_connect_timeout(2)
-        if hasattr(rpctransport, 'set_credentials'):
-            rpctransport.set_credentials(self.username, self.password, self.domain, self.lmhash, self.nthash)
-        dce = rpctransport.get_dce_rpc()
-        dce.connect()
-        dce.bind(uuid)
-        return dce
-
-    def check_admin(self):
-        try:
-            dce = self._get_dce('svcctl', scmr.MSRPC_UUID_SCMR)
-            ans = scmr.hROpenSCManagerW(dce, lpMachineName=self.target, dwDesiredAccess=0x0002)
-            scmr.hRCloseServiceHandle(dce, ans['lpScHandle'])
-            self.is_admin = True
-            return True
-        except:
-            self.is_admin = False
-            return False
-
-    def resolve_sid_via_samr(self, sid_str):
-        try:
-            sid_parts = sid_str.split('-')
-            rid = int(sid_parts[-1])
-            domain_sid_str = '-'.join(sid_parts[:-1])
-            dce = self._get_dce('samr', samr.MSRPC_UUID_SAMR)
-            ans = samr.hSamrConnect(dce)
-            serverHandle = ans['ServerHandle']
-            try:
-                ans = samr.hSamrOpenDomain(dce, serverHandle, domainId=domain_sid_str)
-                domainHandle = ans['DomainHandle']
-            except: return None
-            ans = samr.hSamrOpenUser(dce, domainHandle, userId=rid)
-            userHandle = ans['UserHandle']
-            ans = samr.hSamrQueryInformationUser(dce, userHandle, USER_INFORMATION_CLASS.UserGeneralInformation)
-            user_name = str(ans['Buffer']['General']['UserName'])
-            dce.disconnect()
-            return f"{user_name} (SAMR)"
-        except: return None
-
-    def resolve_sid_via_lsa(self, sid_str):
-        try:
-            dce = self._get_dce('lsarpc', lsat.MSRPC_UUID_LSAT)
-            ans = lsad.hLsarOpenPolicy2(dce)
-            policyHandle = ans['PolicyHandle']
-
-            ans = lsat.hLsarLookupSids(dce, policyHandle, [sid_str])
-            name = str(ans['TranslatedNames']['Names'][0]['Name'])
-
-            lsad.hLsarClose(dce, policyHandle)
-            dce.disconnect()
-            return f"{name} (LSA)"
-        except:
-            return None
-
-    def resolve_sid_name(self, sid_str):
-        if self.ad_enumerator:
-            name = self.ad_enumerator.resolve_sid_via_ldap(sid_str)
-            if name: return name
-
-        name = self.resolve_sid_via_samr(sid_str)
-        if name: return name
-
-        name = self.resolve_sid_via_lsa(sid_str)
-        if name: return name
-
-        return f"{sid_str} (Unknown)"
-
-    def hunt(self):
-        self.check_admin()
-        sessions = []
-        try:
-            dce = self._get_dce('winreg', rrp.MSRPC_UUID_RRP)
-            ans = rrp.hOpenUsers(dce)
-            hRootKey = ans['phKey']
-            index = 0
-            while True:
-                try:
-                    enum_ans = rrp.hBaseRegEnumKey(dce, hRootKey, index)
-                    sid = enum_ans['lpNameOut'].strip('\x00')
-                    if sid.startswith('S-1-5-21-') and not sid.endswith('_Classes'):
-                        username = self.resolve_sid_name(sid)
-                        sessions.append(username)
-                    index += 1
-                except rrp.DCERPCSessionError: break
-                except Exception: break
-            rrp.hBaseRegCloseKey(dce, hRootKey)
-            dce.disconnect()
-            return sessions
-        except Exception:
-            return None
-
-# --- DNS FIX ---
 def simple_dns_query(hostname, dns_server):
     try:
-        transaction_id = b'\xaa\xaa'
-        flags = b'\x01\x00'
-        questions = b'\x00\x01'
-        answer_rrs = b'\x00\x00'
-        authority_rrs = b'\x00\x00'
-        additional_rrs = b'\x00\x00'
-        query = transaction_id + flags + questions + answer_rrs + authority_rrs + additional_rrs
-        for part in hostname.split('.'):
-            query += bytes([len(part)]) + part.encode()
-        query += b'\x00'
-        query += b'\x00\x01' + b'\x00\x01'
+        query = b'\xaa\xaa\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+        for part in hostname.split('.'): query += bytes([len(part)]) + part.encode()
+        query += b'\x00\x00\x01\x00\x01'
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(1)
         sock.sendto(query, (dns_server, 53))
-        data, _ = sock.recvfrom(512)
-        sock.close()
-        if len(data) > 12:
-            ip_bytes = data[-4:]
-            return socket.inet_ntoa(ip_bytes)
+        data, _ = sock.recvfrom(512); sock.close()
+        if len(data) > 12: return socket.inet_ntoa(data[-4:])
     except: return None
     return None
 
 def resolve_target(target, dc_ip):
+    try: socket.inet_aton(target); return target
+    except: pass
+    if dc_ip: return simple_dns_query(target, dc_ip)
+    try: return socket.gethostbyname(target)
+    except: return None
+
+
+class PersistentSessionHunter:
+    def __init__(self, username, password, domain, target_ip, target_name, cache_sids, hashes=None):
+        self.username = username
+        self.password = password
+        self.domain = domain
+        self.target = target_ip 
+        self.target_name = target_name 
+        self.cache_sids = cache_sids
+        self.lmhash = ''
+        self.nthash = ''
+        if hashes: self.lmhash, self.nthash = hashes.split(':')
+
+        self.dce = None 
+        self.connected = False
+        self.is_admin = False
+
+    def connect_rpc(self):
+        """Établit la connexion SMB/RPC et la garde ouverte."""
+        try:
+            binding = f'ncacn_np:{self.target}[\\pipe\\winreg]'
+            rpctransport = transport.DCERPCTransportFactory(binding)
+            rpctransport.set_connect_timeout(2)
+            if hasattr(rpctransport, 'set_credentials'):
+                rpctransport.set_credentials(self.username, self.password, self.domain, self.lmhash, self.nthash)
+
+            self.dce = rpctransport.get_dce_rpc()
+            self.dce.connect()
+            self.dce.bind(rrp.MSRPC_UUID_RRP)
+            self.connected = True
+            return True
+        except:
+            self.connected = False
+            return False
+
+    def check_admin(self):
+        return True
+
+    def hunt(self):
+        if not self.connected:
+            if not self.connect_rpc():
+                return None
+
+        sessions = []
+        try:
+            ans = rrp.hOpenUsers(self.dce)
+            hRootKey = ans['phKey']
+
+            index = 0
+            while True:
+                try:
+                    enum_ans = rrp.hBaseRegEnumKey(self.dce, hRootKey, index)
+                    sid = enum_ans['lpNameOut'].strip('\x00')
+                    if sid.startswith('S-1-5-21-') and not sid.endswith('_Classes'):
+                        if sid in self.cache_sids:
+                            sessions.append(self.cache_sids[sid])
+                        else:
+                            sessions.append(f"{sid} (Unknown)")
+                    index += 1
+                except: break 
+
+            rrp.hBaseRegCloseKey(self.dce, hRootKey)
+            return sessions
+
+        except (DCERPCException, Exception) as e:
+            self.connected = False
+            return None
+
+# --- Main Logic ---
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f: return json.load(f)
+        except: pass
+    return {'sids': {}, 'targets': []}
+
+def save_cache(full_cache):
     try:
-        socket.inet_aton(target)
-        return target
-    except socket.error: pass
-    try:
-        return socket.gethostbyname(target)
-    except socket.error: pass
-    if dc_ip:
-        ip = simple_dns_query(target, dc_ip)
-        if ip: return ip
-    return None
-
-def scan_host(target_name, args, ad_enum):
-    target_ip = resolve_target(target_name, args.dc_ip)
-
-    # Si résolution DNS impossible, on retourne vide (pas d'affichage)
-    if not target_ip:
-         return []
-
-    hunter = SessionHunter(args.username, args.password, args.domain, target_ip, args.hashes, ad_enum)
-    sessions = hunter.hunt()
-
-    results = []
-
-    # Couleur Admin
-    admin_str = "\033[1;32mOUI\033[0m" if hunter.is_admin else "\033[1;31mNON\033[0m"
-
-    # LOGIQUE DE FILTRAGE : Si sessions est None ou vide, on n'ajoute rien.
-    if sessions:
-        for s in sessions:
-            results.append((target_name, admin_str, f"\033[1;36m{s}\033[0m"))
-
-    return results
+        with open(CACHE_FILE, 'w') as f: json.dump(full_cache, f, indent=4)
+    except: pass
 
 def main():
     parser = argparse.ArgumentParser()
@@ -264,53 +192,77 @@ def main():
     parser.add_argument("-d", "--domain", required=True)
     parser.add_argument("-H", "--hashes")
     parser.add_argument("-dc-ip")
-    parser.add_argument("-ldap-base")
     parser.add_argument("-t", "--threads", type=int, default=10)
+    parser.add_argument("-r", "--refresh", action="store_true")
     args = parser.parse_args()
 
     if not args.password and not args.hashes:
-        from getpass import getpass
-        args.password = getpass("Password: ")
+        from getpass import getpass; args.password = getpass("Password: ")
+
+    FULL_CACHE = load_cache()
+    if 'sids' not in FULL_CACHE: FULL_CACHE = {'sids': FULL_CACHE, 'targets': []} # Migration
+    CACHE_SIDS = FULL_CACHE['sids']
+    CACHE_TARGETS = FULL_CACHE['targets']
 
     ad_enum = None
-    if args.dc_ip:
-        ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, args.ldap_base, args.hashes)
+    if args.dc_ip and (not CACHE_SIDS or args.refresh):
+        ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
+        fetched = ad_enum.prefetch_all_users()
+        if fetched: CACHE_SIDS.update(fetched); save_cache(FULL_CACHE)
 
-    targets = []
-    if args.dc_ip and not args.target:
-        print("[*] Récupération des machines via LDAP...")
-        targets = ad_enum.get_domain_computers()
-    elif args.target:
-        targets = [args.target]
+    target_list = []
+    if args.target: target_list = [args.target]
+    elif args.dc_ip:
+        if not CACHE_TARGETS or args.refresh:
+            if not ad_enum: ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
+            target_list = ad_enum.get_domain_computers()
+            if target_list: FULL_CACHE['targets'] = target_list; save_cache(FULL_CACHE)
+        else: target_list = CACHE_TARGETS
 
-    if not targets:
-        print("[-] Aucune cible.")
-        sys.exit(1)
+    if not target_list: print("[-] Aucune cible."); sys.exit(1)
+
+    print(f"[*] Initialisation des connexions persistantes vers {len(target_list)} cibles...")
+    hunters = []
+
+    for host in target_list:
+        ip = resolve_target(host, args.dc_ip)
+        if ip:
+            hunter = PersistentSessionHunter(args.username, args.password, args.domain, ip, host, CACHE_SIDS, args.hashes)
+            hunters.append(hunter)
 
     try:
         while True:
             all_rows = []
+
             with ThreadPoolExecutor(max_workers=args.threads) as executor:
-                futures = [executor.submit(scan_host, t, args, ad_enum) for t in targets]
+                futures = {executor.submit(h.hunt): h for h in hunters}
+
                 for future in futures:
-                    res = future.result()
-                    if res: all_rows.extend(res)
+                    h = futures[future]
+                    sessions = future.result()
+
+                    if sessions:
+                        for s in sessions:
+                            all_rows.append((h.target_name, "\033[1;32mOUI\033[0m", f"\033[1;36m{s}\033[0m"))
+                    elif sessions is None:
+                        pass
 
             os.system('cls' if os.name == 'nt' else 'clear')
-            print(f"--- SESSION HUNTER --- {datetime.now().strftime('%H:%M:%S')} (Ctrl+C to stop)")
-            print(f"{'HOST':<30} | {'ADMIN':<10} | {'SESSION(S)':<50}")
+            print(f"--- SESSION HUNTER (Persistent Mode) --- {datetime.now().strftime('%H:%M:%S')} (Ctrl+C to stop)")
+            print(f"Cache: {len(CACHE_SIDS)} Users | Monitors: {len(hunters)} Hosts")
+            print(f"{'HOST':<30} | {'ACTIVE':<10} | {'SESSION(S)':<50}")
             print("-" * 95)
 
-            if not all_rows:
-                print("No active sessions found.")
+            if not all_rows: print("No active sessions found.")
             else:
                 for row in all_rows:
                     host, admin, user = row
                     print(f"{host:<30} | {admin:<10} | {user:<50}")
 
             time.sleep(1800)
+
     except KeyboardInterrupt:
-        print("\n[!] Arrêt demandé.")
+        print("\n[!] Closing connections...")
         sys.exit(0)
 
 if __name__ == "__main__":
