@@ -55,49 +55,85 @@ class ADEnumerator:
     def prefetch_all_users(self):
         cache_update = {}
         if not self.connect(): return {}
-        print("[*] LDAP: Prefetching all users...")
+        print("[*] LDAP: Prefetching all users (with paging)...")
         try:
-            resp = self.ldap_connection.search(searchBase=self.base_dn, searchFilter="(&(objectClass=user)(objectCategory=person))", attributes=['sAMAccountName', 'objectSid'])
-            for item in resp:
-                if isinstance(item, ldapasn1.SearchResultEntry):
-                    username = None; sid_str = None
-                    for attr in item['attributes']:
-                        if str(attr['type']) == 'sAMAccountName': username = str(attr['vals'][0])
-                        elif str(attr['type']) == 'objectSid': sid_str = self.binary_sid_to_string(attr['vals'][0])
-                    if username and sid_str: cache_update[sid_str] = f"{self.domain}\\{username}"
+            # Création du contrôle pour demander les résultats par lots de 500
+            controls = ldapasn1.SimplePagedResultsControl(criticality=True, size=500, cookie='')
+            
+            while True:
+                resp = self.ldap_connection.search(
+                    searchBase=self.base_dn, 
+                    searchFilter="(&(objectClass=user)(objectCategory=person))", 
+                    attributes=['sAMAccountName', 'objectSid'],
+                    searchControls=[controls]
+                )
+                
+                for item in resp:
+                    if isinstance(item, ldapasn1.SearchResultEntry):
+                        username = None; sid_str = None
+                        for attr in item['attributes']:
+                            if str(attr['type']) == 'sAMAccountName': username = str(attr['vals'][0])
+                            elif str(attr['type']) == 'objectSid': sid_str = self.binary_sid_to_string(attr['vals'][0])
+                        if username and sid_str: cache_update[sid_str] = f"{self.domain}\\{username}"
+                
+                # Cherche le cookie pour la page suivante
+                next_cookie = None
+                for item in resp:
+                    if isinstance(item, ldapasn1.SearchResultDone):
+                        for ctrl in item['controls']:
+                            if ctrl['controlType'] == ldapasn1.SimplePagedResultsControl.controlType:
+                                paged_ctrl = ldapasn1.SimplePagedResultsControl(ctrl['controlValue'])
+                                next_cookie = paged_ctrl['cookie']
+                                break
+                
+                if not next_cookie: break # Plus de pages à lire
+                controls['cookie'] = next_cookie # Met à jour le cookie pour la prochaine requête
+                
             return cache_update
-        except: return {}
+        except Exception as e: 
+            print(f"[-] LDAP Error: {e}")
+            return {}
 
     def get_domain_computers(self):
         if not self.connect(): return []
         
-        print("[*] LDAP: Downloading computer list...")
-        
-        def parse_results(response):
-            comps = []
-            for item in response:
-                if isinstance(item, ldapasn1.SearchResultEntry):
-                    for attr in item['attributes']:
-                        if str(attr['type']) == 'dNSHostName': 
-                            val = str(attr['vals'][0])
-                            comps.append(val)
-            return comps
-
+        print("[*] LDAP: Downloading computer list (with paging)...")
+        comps = []
         try:
-            # Tentative 1
-            resp = self.ldap_connection.search(searchFilter="(&(objectCategory=computer))", attributes=['dNSHostName'])
-            return parse_results(resp)
-        except Exception:
-            # Si échec (ex: Broken Pipe après le prefetch des users), on reconnecte et on réessaie
-            # print("[!] LDAP connection timed out, retrying...") # Debug info
-            self.ldap_connection = None # Force le reset
-            if self.connect():
-                try:
-                    resp = self.ldap_connection.search(searchFilter="(&(objectCategory=computer))", attributes=['dNSHostName'])
-                    return parse_results(resp)
-                except: pass
-        
-        return []
+            controls = ldapasn1.SimplePagedResultsControl(criticality=True, size=500, cookie='')
+            
+            while True:
+                resp = self.ldap_connection.search(
+                    searchFilter="(&(objectCategory=computer))", 
+                    attributes=['dNSHostName'],
+                    searchControls=[controls]
+                )
+                
+                for item in resp:
+                    if isinstance(item, ldapasn1.SearchResultEntry):
+                        for attr in item['attributes']:
+                            if str(attr['type']) == 'dNSHostName': 
+                                val = str(attr['vals'][0])
+                                comps.append(val)
+                
+                # Cherche le cookie pour la page suivante
+                next_cookie = None
+                for item in resp:
+                    if isinstance(item, ldapasn1.SearchResultDone):
+                        for ctrl in item['controls']:
+                            if ctrl['controlType'] == ldapasn1.SimplePagedResultsControl.controlType:
+                                paged_ctrl = ldapasn1.SimplePagedResultsControl(ctrl['controlValue'])
+                                next_cookie = paged_ctrl['cookie']
+                                break
+                                
+                if not next_cookie: break
+                controls['cookie'] = next_cookie
+                
+            return comps
+        except Exception as e:
+            print(f"[-] LDAP Error: {e}")
+            self.ldap_connection = None
+            return []
 
 def simple_dns_query(hostname, dns_server):
     try:
@@ -234,66 +270,77 @@ def main():
     if not args.password and not args.hashes:
         from getpass import getpass; args.password = getpass("Password: ")
 
+    # 1. Chargement du cache existant
     FULL_CACHE = load_cache()
-    if 'sids' not in FULL_CACHE: FULL_CACHE = {'sids': FULL_CACHE, 'targets': []}
+    if 'sids' not in FULL_CACHE: 
+        FULL_CACHE = {'sids': FULL_CACHE if isinstance(FULL_CACHE, dict) else {}, 'targets': []}
+    
     CACHE_SIDS = FULL_CACHE['sids']
     CACHE_TARGETS = FULL_CACHE['targets']
 
+    # 2. Initialisation LDAP si nécessaire
     ad_enum = None
     if args.dc_ip:
-        need_users = (not CACHE_SIDS or args.refresh)
-        need_targets = (not CACHE_TARGETS or args.refresh) and not args.target
-        
-        if need_users or need_targets:
-            ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
+        ad_enum = ADEnumerator(args.username, args.password, args.domain, args.dc_ip, hashes=args.hashes)
 
-    if args.dc_ip and (not CACHE_SIDS or args.refresh):
-        fetched = ad_enum.prefetch_all_users()
-        if fetched: CACHE_SIDS.update(fetched); save_cache(FULL_CACHE)
+        # Remplissage du cache SIDs (Users) si vide ou demandé
+        if not CACHE_SIDS or args.refresh:
+            fetched_users = ad_enum.prefetch_all_users()
+            if fetched_users:
+                CACHE_SIDS.update(fetched_users)
+                FULL_CACHE['sids'] = CACHE_SIDS
+                save_cache(FULL_CACHE)
+                print(f"[+] Cache updated: {len(CACHE_SIDS)} users.")
 
+    # 3. Détermination de la liste des cibles
     target_list = []
-    if args.target: target_list = [args.target]
+    if args.target:
+        target_list = [args.target]
     elif args.dc_ip:
+        # Si le cache targets est vide ou refresh demandé, on interroge l'AD
         if not CACHE_TARGETS or args.refresh:
             target_list = ad_enum.get_domain_computers()
-            if target_list: 
+            if target_list:
                 FULL_CACHE['targets'] = target_list
                 save_cache(FULL_CACHE)
-        else: 
+        else:
             target_list = CACHE_TARGETS
 
-    if not target_list: 
-        print("[-] No target found (LDAP issue or empty cache).")
+    if not target_list:
+        print("[-] No target found. Please provide a target or a valid DC-IP.")
         sys.exit(1)
 
-    print(f"[*] Initialization a connections to {len(target_list)} cibles...")
+    # 4. Initialisation des chasseurs
+    print(f"[*] Initializing connections to {len(target_list)} targets...")
     hunters = []
-
     for host in target_list:
         ip = resolve_target(host, args.dc_ip)
         if ip:
+            # On passe bien CACHE_SIDS qui contient maintenant les données (neuves ou anciennes)
             hunter = PersistentSessionHunter(args.username, args.password, args.domain, ip, host, CACHE_SIDS, args.hashes)
             hunters.append(hunter)
 
+    if not hunters:
+        print("[-] No reachable targets.")
+        sys.exit(1)
+
+    # 5. Boucle de monitoring
     try:
         while True:
             all_rows = []
-
             with ThreadPoolExecutor(max_workers=args.threads) as executor:
                 futures = {executor.submit(h.hunt): h for h in hunters}
-
                 for future in futures:
                     h = futures[future]
-                    sessions = future.result()
-
-                    if h.is_admin: admin_str = "\033[1;32mYES\033[0m"
-                    else: admin_str = "\033[1;31mNO\033[0m"
-
-                    if sessions:
-                        for s in sessions:
-                            all_rows.append((h.target_name, admin_str, f"\033[1;36m{s}\033[0m"))
-                    elif sessions is None:
-                        pass
+                    try:
+                        sessions = future.result()
+                        admin_str = "\033[1;32mYES\033[0m" if h.is_admin else "\033[1;31mNO\033[0m"
+                        
+                        if sessions:
+                            for s in sessions:
+                                all_rows.append((h.target_name, admin_str, f"\033[1;36m{s}\033[0m"))
+                    except Exception:
+                        continue
 
             os.system('cls' if os.name == 'nt' else 'clear')
             print(f"--- SESSION HUNTER --- {datetime.now().strftime('%H:%M:%S')} (Ctrl+C to stop)")
@@ -301,13 +348,14 @@ def main():
             print(f"{'HOST':<30} | {'ADMIN':<10} | {'SESSION(S)':<50}")
             print("-" * 95)
             
-            if not all_rows: print("No active sessions found.")
+            if not all_rows:
+                print("No active sessions found.")
             else:
                 for row in all_rows:
                     host, admin, user = row
                     print(f"{host:<30} | {admin:<10} | {user:<50}")
 
-            time.sleep(1800)
+            time.sleep(1800) # Attente avant le prochain cycle (30 minutes par défaut)
 
     except KeyboardInterrupt:
         print("\n[!] Closing connections...")
